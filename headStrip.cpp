@@ -1,113 +1,106 @@
 #include "headStrip.h"
 #include <Arduino_FreeRTOS.h>
+#include <queue.h>
+#include <semphr.h>
 #include "mauriceServos.h"
 #define PIXEL_PIN    6  // Digital IO pin connected to the NeoPixels.
 #define PIXEL_COUNT 3  // Number of NeoPixels
-#include <Adafruit_NeoPixel.h>
 
 Adafruit_NeoPixel headStrip(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
-//NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> headStrip(PIXEL_COUNT, PIXEL_PIN);
+
 // boot : full red
 // search wifi : red rotating
 // wifi ok : full green
 // wifi AP : orange
 // error : red blink (no wifi or else)
 
-void theaterChase(uint32_t color, int wait);
-void rainbow(int wait);
-void theaterChaseRainbow(int wait);
-void colorWipe(uint32_t color, int wait);
-void headStripTask();
+static bool shouldStop = false;
+static QueueHandle_t inQueue;
+static SemaphoreHandle_t outMutex;
 
-#define STRIP_BOOT        0
-#define STRIP_WIFI_SEARCH 1
-#define STRIP_WIFI_OK     2
-#define STRIP_WIFI_AP     3
-#define STRIP_ERROR1      4
-#define STRIP_OFF         5
-#define STRIP_MOOVING     6
-#define STRIP_RAINBOW     7
-#define STRIP_CHASE_RAINBOW     8
-
-static TaskHandle_t taskHandle = NULL;
-uint8_t     mode     = STRIP_OFF;
-
-void killTask() {
-  if (taskHandle != NULL) {
-    vTaskDelete(taskHandle);
-    taskHandle = NULL;
+static void stripTask(void *)
+{
+  int scenario;
+  for (;;) {
+    xQueueReceive(inQueue, &scenario, portMAX_DELAY);
+    shouldStop = false;
+    xSemaphoreTake(outMutex, portMAX_DELAY);
+    switch(scenario) {           
+      case STRIP_BOOT:
+        colorWipe(headStrip.Color(255,   0,   0), 50);    // Red
+        break;
+      case STRIP_WIFI_SEARCH:
+        colorWipe(headStrip.Color(255,   0,   0), 50);    // Red
+        break;
+      case STRIP_WIFI_OK:
+        colorWipe(headStrip.Color(0,   255,   0), 50);    // Green
+        break;
+      case STRIP_WIFI_AP:
+        colorWipe(headStrip.Color(0,   0,   255), 50);    // Blue
+        break;
+      case STRIP_OFF:
+        colorWipe(headStrip.Color(0,   0,   0), 50);    // Black/off
+        //theaterChase(headStrip.Color(127,   0,   0), 50); // Red
+        break;
+      case STRIP_ERROR1:
+        theaterChase(headStrip.Color(127, 127, 127), 50); // White
+        break;
+      case STRIP_MOOVING:
+        theaterChase(headStrip.Color(0,   0,   255), 50); // Blue
+        break;
+      case STRIP_RAINBOW:
+        rainbow(10);
+        break;
+      case STRIP_CHASE_RAINBOW:
+        theaterChaseRainbow(50);
+        break;       
+    }  
+    //Serial.print(scenario);
+    xSemaphoreGive(outMutex); // allow execution
   }
 }
 
-void startTask() {
-  killTask();
-    // restart the same
-  xTaskCreate(headStripTask, "headStripTask", 2048, NULL, 10, &taskHandle);
-}
+static uint8_t     mode     = STRIP_BOOT;
+
 void headStripNextScenario() {
   mode++  ;
   if (mode > STRIP_CHASE_RAINBOW) {
     mode = STRIP_BOOT;
   }
-  switch(mode) {           
-    case STRIP_BOOT:
-      killTask();
-      colorWipe(headStrip.Color(255,   0,   0), 50);    // Red
-      break;
-    case STRIP_WIFI_SEARCH:
-      killTask();
-      colorWipe(headStrip.Color(255,   0,   0), 50);    // Red
-      break;
-    case STRIP_WIFI_OK:
-      killTask();
-      colorWipe(headStrip.Color(0,   255,   0), 50);    // Green
-      break;
-    case STRIP_WIFI_AP:
-      killTask();
-      colorWipe(headStrip.Color(0,   0,   255), 50);    // Blue
-      break;
-    case STRIP_OFF:
-      killTask();
-      colorWipe(headStrip.Color(0,   0,   0), 50);    // Black/off
-      //theaterChase(headStrip.Color(127,   0,   0), 50); // Red
-      break;
-    case STRIP_ERROR1:
-    case STRIP_MOOVING:
-    case STRIP_RAINBOW:
-    case STRIP_CHASE_RAINBOW:
-      // create task
-      break;       
-  }
+  shouldStop = true;
+  xSemaphoreTake(outMutex, portMAX_DELAY); // wait end of prev scenario
+  xSemaphoreGive(outMutex); // allow execution
   
-}
-
-void headStripTask(void */*pvParameters*/) { // for complex mouvements
-  switch(mode) {           
-    case STRIP_ERROR1:
-      theaterChase(headStrip.Color(127, 127, 127), 50); // White
-      break;
-    case STRIP_MOOVING:
-      theaterChase(headStrip.Color(0,   0,   255), 50); // Blue
-      break;
-    case STRIP_RAINBOW:
-      rainbow(10);
-      break;
-    case STRIP_CHASE_RAINBOW:
-      theaterChaseRainbow(50);
-      break;       
-  }
+  if (xQueueSend(inQueue, &mode, 2) != pdTRUE) {
+    Serial.println("Enqueue error");
+  }; // start scenario
 }
 
 void headStripSetup() {
   headStrip.begin(); 
   headStrip.show();  // Initialize all pixels to 'off'
-  headStrip.setBrightness(50); // Set BRIGHTNESS to about 1/5 (max = 255)
+  //headStrip.setBrightness(50); // Set BRIGHTNESS to about 1/5 (max = 255)
+  inQueue = xQueueCreate(2, sizeof(int));
+  outMutex = xSemaphoreCreateMutex();
+  colorWipe(headStrip.Color(255,   0,   0), 50); // initial scenario
+  xTaskCreate(
+    stripTask
+    ,  "D"  // A name just for humans
+    ,  100  // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  NULL
+    ,  2// Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
+    ,  NULL );  
 }
 
 void headStripSetMode(uint8_t _mode) {
   mode = _mode;
-  mode -= 1;
-  headStripNextScenario();
+  if (mode > STRIP_CHASE_RAINBOW || mode < STRIP_BOOT) {
+    mode = STRIP_BOOT;
+  }
+  shouldStop = true;
+  xSemaphoreTake(outMutex, portMAX_DELAY);
+  xSemaphoreGive(outMutex); // allow execution
+  xQueueSend(inQueue, &mode, 2);
 }
 
 // Fill strip pixels one after another with a color. Strip is NOT cleared
@@ -118,9 +111,9 @@ void headStripSetMode(uint8_t _mode) {
 void colorWipe(uint32_t color, int wait) {
   for(uint16_t i=0; i<headStrip.numPixels(); i++) { // For each pixel in strip...
     headStrip.setPixelColor(i, color);         //  Set pixel's color (in RAM)
-    headStrip.show();                          //  Update strip to match
-    vTaskDelay(wait);
+    //vTaskDelay(wait);
   }
+  headStrip.show();                          //  Update strip to match
 }
 
 // Theater-marquee-style chasing lights. Pass in a color (32-bit value,
@@ -135,6 +128,10 @@ void theaterChase(uint32_t color, int wait) {
         headStrip.setPixelColor(c, color); // Set pixel 'c' to value 'color'
       }
       headStrip.show(); // Update strip with new contents
+      if (shouldStop) {
+        shouldStop = false;
+        return;
+      }
       vTaskDelay(wait);
     }
   }
@@ -160,6 +157,10 @@ void rainbow(int wait) {
       headStrip.setPixelColor(i, headStrip.gamma32(headStrip.ColorHSV(pixelHue)));
     }
     headStrip.show(); // Update strip with new contents
+    if (shouldStop) {
+      shouldStop = false;
+      return;
+    }
     vTaskDelay(wait);
   }
 }
@@ -180,6 +181,10 @@ void theaterChaseRainbow(int wait) {
         headStrip.setPixelColor(c, color); // Set pixel 'c' to value 'color'
       }
       headStrip.show();                // Update strip with new contents
+      if (shouldStop) {
+        shouldStop = false;
+        return;
+      }
       vTaskDelay(wait);
       firstPixelHue += 65536 / 90; // One cycle of color wheel over 90 frames
     }
